@@ -379,7 +379,7 @@ class MatterMapPanel extends HTMLElement {
           <aside>
             <div class="metric-grid">
               <div class="metric"><strong>${topology.summary.matter_thread_nodes || 0}</strong><span>Matter devices</span></div>
-              <div class="metric"><strong>${topology.summary.external_thread_nodes || 0}</strong><span>External nodes</span></div>
+              <div class="metric"><strong>${topology.summary.unresolved_thread_links || 0}</strong><span>Unresolved links</span></div>
               <div class="metric"><strong>${topology.summary.links || 0}</strong><span>Links</span></div>
               <div class="metric"><strong>${topology.summary.partial_errors || 0}</strong><span>Read errors</span></div>
             </div>

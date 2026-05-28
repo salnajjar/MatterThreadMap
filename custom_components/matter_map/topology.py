@@ -55,7 +55,8 @@ async def async_build_topology(hass: HomeAssistant) -> dict[str, Any]:
     device_registry = dr.async_get(hass)
     nodes: dict[str, TopologyNode] = {}
     links: dict[str, TopologyLink] = {}
-    ids_by_mac: dict[str, str] = {}
+    ids_by_thread_identity: dict[str, str] = {}
+    unresolved_links = 0
     errors: list[dict[str, str]] = []
 
     matter_nodes = sorted(client.get_nodes(), key=lambda item: item.node_id)
@@ -75,11 +76,10 @@ async def async_build_topology(hass: HomeAssistant) -> dict[str, Any]:
             matter_node
         )
         role = diagnostics.node_type.value
-        mac_address = _normalize_hex(diagnostics.mac_address)
-        if mac_address:
-            ids_by_mac[mac_address] = node_key
-
         thread_cluster = _thread_cluster(matter_node)
+        for alias in _thread_aliases(thread_cluster, diagnostics.mac_address):
+            ids_by_thread_identity[alias] = node_key
+
         nodes[node_key] = TopologyNode(
             id=node_key,
             label=label,
@@ -94,6 +94,9 @@ async def async_build_topology(hass: HomeAssistant) -> dict[str, Any]:
                 "fabric_index": diagnostics.active_fabric_index,
                 "fabrics": [asdict(fabric) for fabric in diagnostics.active_fabrics],
                 "leader_cost": _leader_cost(thread_cluster),
+                "thread_aliases": sorted(
+                    _thread_aliases(thread_cluster, diagnostics.mac_address)
+                ),
             },
         )
 
@@ -106,8 +109,12 @@ async def async_build_topology(hass: HomeAssistant) -> dict[str, Any]:
         if thread_cluster is None:
             continue
 
-        _add_neighbor_links(nodes, links, ids_by_mac, source_key, thread_cluster)
-        _add_route_links(nodes, links, ids_by_mac, source_key, thread_cluster)
+        unresolved_links += _add_neighbor_links(
+            links, ids_by_thread_identity, source_key, thread_cluster
+        )
+        unresolved_links += _add_route_links(
+            links, ids_by_thread_identity, source_key, thread_cluster
+        )
 
     return {
         "nodes": [asdict(node) for node in nodes.values()],
@@ -117,29 +124,27 @@ async def async_build_topology(hass: HomeAssistant) -> dict[str, Any]:
             "external_thread_nodes": sum(1 for node in nodes.values() if node.external),
             "links": len(links),
             "partial_errors": len(errors),
+            "unresolved_thread_links": unresolved_links,
         },
         "errors": errors,
     }
 
 
 def _add_neighbor_links(
-    nodes: dict[str, TopologyNode],
     links: dict[str, TopologyLink],
-    ids_by_mac: dict[str, str],
+    ids_by_thread_identity: dict[str, str],
     source_key: str,
     thread_cluster: Any,
-) -> None:
+) -> int:
     """Add links from Thread neighbor table data."""
+    unresolved = 0
     for index, neighbor in enumerate(_table(thread_cluster, "neighborTable")):
-        neighbor_id = _neighbor_identity(neighbor, index)
-        target_key = _resolve_external_node(
-            nodes,
-            ids_by_mac,
-            neighbor_id,
-            "Thread neighbor",
-            _neighbor_role(neighbor),
-            {"rloc16": _safe_get(neighbor, "rloc16"), "source": "neighbor_table"},
+        target_key = _resolve_thread_identity(
+            ids_by_thread_identity, _neighbor_identities(neighbor, index)
         )
+        if target_key is None or target_key == source_key:
+            unresolved += 1
+            continue
         rssi = _safe_get(neighbor, "averageRssi", "lastRssi")
         lqi_in = _safe_get(neighbor, "lqiIn")
         quality = _quality_from_lqi_rssi(lqi_in, rssi)
@@ -147,7 +152,7 @@ def _add_neighbor_links(
         _put_link(
             links,
             TopologyLink(
-                id=f"{source_key}:neighbor:{target_key}",
+                id=_link_id(source_key, target_key, relationship),
                 source=source_key,
                 target=target_key,
                 relationship=relationship,
@@ -157,37 +162,35 @@ def _add_neighbor_links(
                 details=_compact_details(neighbor),
             ),
         )
+    return unresolved
 
 
 def _add_route_links(
-    nodes: dict[str, TopologyNode],
     links: dict[str, TopologyLink],
-    ids_by_mac: dict[str, str],
+    ids_by_thread_identity: dict[str, str],
     source_key: str,
     thread_cluster: Any,
-) -> None:
+) -> int:
     """Add links from Thread route table data."""
+    unresolved = 0
     for index, route in enumerate(_table(thread_cluster, "routeTable")):
         if _safe_get(route, "allocated") is False:
             continue
         if _safe_get(route, "linkEstablished") is False:
             continue
-        route_id = _route_identity(route, index)
-        target_key = _resolve_external_node(
-            nodes,
-            ids_by_mac,
-            route_id,
-            "Thread router",
-            "routing_end_device",
-            {"router_id": _safe_get(route, "routerId"), "source": "route_table"},
+        target_key = _resolve_thread_identity(
+            ids_by_thread_identity, _route_identities(route, index)
         )
+        if target_key is None or target_key == source_key:
+            unresolved += 1
+            continue
         lqi_in = _safe_get(route, "lqiIn")
         lqi_out = _safe_get(route, "lqiOut")
         path_cost = _safe_get(route, "pathCost")
         _put_link(
             links,
             TopologyLink(
-                id=f"{source_key}:route:{target_key}",
+                id=_link_id(source_key, target_key, "route"),
                 source=source_key,
                 target=target_key,
                 relationship="route",
@@ -198,6 +201,7 @@ def _add_route_links(
                 details=_compact_details(route),
             ),
         )
+    return unresolved
 
 
 def _put_link(links: dict[str, TopologyLink], link: TopologyLink) -> None:
@@ -205,6 +209,12 @@ def _put_link(links: dict[str, TopologyLink], link: TopologyLink) -> None:
     existing = links.get(link.id)
     if existing is None or (link.quality or 0) > (existing.quality or 0):
         links[link.id] = link
+
+
+def _link_id(source_key: str, target_key: str, relationship: str) -> str:
+    """Return a stable undirected graph link id."""
+    first, second = sorted((source_key, target_key))
+    return f"{first}:{relationship}:{second}"
 
 
 def _thread_cluster(matter_node: Any) -> Any | None:
@@ -228,6 +238,22 @@ def _leader_cost(thread_cluster: Any | None) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _thread_aliases(thread_cluster: Any | None, mac_address: str | None) -> set[str]:
+    """Return known identifiers for a paired Matter node on Thread."""
+    aliases: set[str] = set()
+    _add_alias(aliases, mac_address)
+    if thread_cluster is None:
+        return aliases
+
+    for value in (
+        _safe_get(thread_cluster, "extendedAddress", "extAddress", "eui64"),
+        _safe_get(thread_cluster, "rloc16", "RLOC16"),
+        _safe_get(thread_cluster, "routerId", "routerID"),
+    ):
+        _add_alias(aliases, value)
+    return aliases
+
+
 def _table(cluster: Any, attr_name: str) -> Iterable[Any]:
     """Return a Thread diagnostics table as an iterable."""
     value = getattr(cluster, attr_name, None)
@@ -236,47 +262,34 @@ def _table(cluster: Any, attr_name: str) -> Iterable[Any]:
     return value
 
 
-def _resolve_external_node(
-    nodes: dict[str, TopologyNode],
-    ids_by_mac: dict[str, str],
-    identity: str,
-    label_prefix: str,
-    role: str,
-    details: dict[str, Any],
-) -> str:
-    """Resolve a table identity to an existing or external graph node."""
-    normalized = _normalize_hex(identity)
-    if normalized in ids_by_mac:
-        return ids_by_mac[normalized]
-
-    key = f"thread:{normalized or identity}"
-    if key not in nodes:
-        nodes[key] = TopologyNode(
-            id=key,
-            label=f"{label_prefix} {identity}",
-            node_id=None,
-            kind="thread",
-            role=role,
-            available=None,
-            external=True,
-            details=details,
-        )
-    return key
+def _resolve_thread_identity(
+    ids_by_thread_identity: dict[str, str], identities: Iterable[Any]
+) -> str | None:
+    """Resolve a Thread table identity to a paired Matter graph node."""
+    for identity in identities:
+        normalized = _normalize_hex(identity)
+        if normalized and normalized in ids_by_thread_identity:
+            return ids_by_thread_identity[normalized]
+    return None
 
 
-def _neighbor_identity(neighbor: Any, index: int) -> str:
-    """Return the best stable identifier from a neighbor table row."""
-    return str(
-        _safe_get(neighbor, "extAddress", "extendedAddress", "rloc16", "routerId")
-        or f"neighbor-{index}"
+def _neighbor_identities(neighbor: Any, index: int) -> tuple[Any, ...]:
+    """Return all usable identifiers from a neighbor table row."""
+    return (
+        _safe_get(neighbor, "extAddress", "extendedAddress", "eui64"),
+        _safe_get(neighbor, "rloc16", "RLOC16"),
+        _safe_get(neighbor, "routerId", "routerID"),
+        f"neighbor-{index}",
     )
 
 
-def _route_identity(route: Any, index: int) -> str:
-    """Return the best stable identifier from a route table row."""
-    return str(
-        _safe_get(route, "extAddress", "extendedAddress", "routerId", "rloc16")
-        or f"route-{index}"
+def _route_identities(route: Any, index: int) -> tuple[Any, ...]:
+    """Return all usable identifiers from a route table row."""
+    return (
+        _safe_get(route, "extAddress", "extendedAddress", "eui64"),
+        _safe_get(route, "routerId", "routerID"),
+        _safe_get(route, "rloc16", "RLOC16"),
+        f"route-{index}",
     )
 
 
@@ -345,6 +358,13 @@ def _normalize_hex(value: Any) -> str:
     if isinstance(value, bytes):
         return value.hex()
     return "".join(char.lower() for char in str(value) if char.isalnum())
+
+
+def _add_alias(aliases: set[str], value: Any) -> None:
+    """Add a normalized Thread identifier alias."""
+    normalized = _normalize_hex(value)
+    if normalized:
+        aliases.add(normalized)
 
 
 def _node_key(node_id: int) -> str:
