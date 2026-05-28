@@ -560,7 +560,7 @@ class MatterMapPanel extends HTMLElement {
       graph.nodeById.set(node.id, node);
     });
 
-    graph.links = rawLinks
+    graph.links = this._combineVisualLinks(rawLinks)
       .map((rawLink) => {
         const source = graph.nodeById.get(rawLink.source);
         const target = graph.nodeById.get(rawLink.target);
@@ -582,6 +582,35 @@ class MatterMapPanel extends HTMLElement {
     this._persistGraphState(graph.nodes);
     graph.alpha = 1;
     return graph;
+  }
+
+  _combineVisualLinks(rawLinks) {
+    const linksByPair = new Map();
+    rawLinks.forEach((link) => {
+      const firstSecond = [link.source, link.target].sort();
+      const key = `${firstSecond[0]}:${firstSecond[1]}`;
+      const existing = linksByPair.get(key);
+      if (!existing) {
+        linksByPair.set(key, {
+          ...link,
+          id: key,
+          relationship: link.relationship || "link",
+          relationships: new Set([link.relationship || "link"]),
+        });
+        return;
+      }
+      existing.relationships.add(link.relationship || "link");
+      existing.relationship = Array.from(existing.relationships).sort().join(" / ");
+      existing.quality = Math.max(existing.quality || 0, link.quality || 0) || null;
+      existing.rssi = existing.rssi || link.rssi;
+      existing.lqi_in = Math.max(existing.lqi_in || 0, link.lqi_in || 0) || null;
+      existing.lqi_out = Math.max(existing.lqi_out || 0, link.lqi_out || 0) || null;
+      existing.path_cost = existing.path_cost || link.path_cost;
+    });
+    return Array.from(linksByPair.values()).map((link) => {
+      const { relationships, ...visualLink } = link;
+      return visualLink;
+    });
   }
 
   _sizedGraph(nodeCount) {
