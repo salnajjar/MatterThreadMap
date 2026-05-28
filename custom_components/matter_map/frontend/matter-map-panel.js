@@ -515,7 +515,7 @@ class MatterMapPanel extends HTMLElement {
   _emptyGraph() {
     return {
       width: 1200,
-      height: 760,
+      height: 800,
       nodes: [],
       links: [],
       nodeById: new Map(),
@@ -525,7 +525,7 @@ class MatterMapPanel extends HTMLElement {
   }
 
   _buildGraph(rawNodes, rawLinks) {
-    const graph = this._emptyGraph();
+    const graph = this._sizedGraph(rawNodes.length);
     const centerNode = this._chooseCenterNode(rawNodes, rawLinks);
     graph.centerId = centerNode ? centerNode.id : undefined;
 
@@ -577,9 +577,18 @@ class MatterMapPanel extends HTMLElement {
       })
       .filter((link) => Boolean(link));
 
-    this._resolveCollisions(graph.nodes, graph.width, graph.height, 28);
+    this._repairStackedState(graph.nodes, centerX, centerY);
+    this._resolveCollisions(graph.nodes, graph.width, graph.height, 52);
     this._persistGraphState(graph.nodes);
     graph.alpha = 1;
+    return graph;
+  }
+
+  _sizedGraph(nodeCount) {
+    const graph = this._emptyGraph();
+    const radius = Math.max(320, 84 * Math.sqrt(Math.max(1, nodeCount)));
+    graph.width = Math.max(1200, Math.ceil(radius * 2 + 360));
+    graph.height = Math.max(800, Math.ceil(radius * 2 + 300));
     return graph;
   }
 
@@ -642,15 +651,48 @@ class MatterMapPanel extends HTMLElement {
     if (isCenter) {
       return { x: centerX, y: centerY };
     }
-    const ringIndex = Math.floor((index - 1) / 10);
-    const ringPosition = (index - 1) % 10;
-    const ringCount = Math.min(10, count);
-    const angle = (Math.PI * 2 * ringPosition) / ringCount - Math.PI / 2 + ringIndex * 0.33;
-    const radius = 215 + ringIndex * 120;
+    const spiralIndex = Math.max(0, index - 1);
+    const angle = spiralIndex * 2.399963229728653;
+    const radius = 190 + 78 * Math.sqrt(spiralIndex);
     return {
       x: centerX + Math.cos(angle) * radius,
       y: centerY + Math.sin(angle) * radius,
     };
+  }
+
+  _repairStackedState(nodes, centerX, centerY) {
+    const buckets = new Map();
+    nodes.forEach((node) => {
+      if (node.isCenter || node.pinned) {
+        return;
+      }
+      const key = `${Math.round(node.x / 24)}:${Math.round(node.y / 24)}`;
+      buckets.set(key, (buckets.get(key) || 0) + 1);
+    });
+
+    let needsRepair = false;
+    buckets.forEach((count) => {
+      if (count > 2) {
+        needsRepair = true;
+      }
+    });
+
+    if (!needsRepair) {
+      return;
+    }
+
+    let index = 1;
+    nodes.forEach((node) => {
+      if (node.isCenter || node.pinned) {
+        return;
+      }
+      const fallback = this._fallbackPosition(index, nodes.length, false, centerX, centerY);
+      node.x = fallback.x;
+      node.y = fallback.y;
+      node.vx = 0;
+      node.vy = 0;
+      index += 1;
+    });
   }
 
   _startSimulation() {
@@ -766,8 +808,9 @@ class MatterMapPanel extends HTMLElement {
       }
       node.vx *= 0.86;
       node.vy *= 0.86;
-      node.x = Math.max(padding, Math.min(width - padding, node.x + node.vx));
-      node.y = Math.max(padding, Math.min(height - padding, node.y + node.vy));
+      node.x += node.vx;
+      node.y += node.vy;
+      this._nudgeInside(node, width, height, padding);
     });
   }
 
@@ -813,23 +856,51 @@ class MatterMapPanel extends HTMLElement {
             continue;
           }
           const shift = (minDistance - distance) / distance;
-          const sx = dx * shift * 0.55;
-          const sy = dy * shift * 0.55;
-          if (!this._isFixed(a)) {
-            a.x = Math.max(padding, Math.min(width - padding, a.x - sx));
-            a.y = Math.max(padding, Math.min(height - padding, a.y - sy));
+          const sx = dx * shift * 0.36;
+          const sy = dy * shift * 0.36;
+          const aFixed = this._isFixed(a);
+          const bFixed = this._isFixed(b);
+          if (!aFixed && !bFixed) {
+            a.x -= sx;
+            a.y -= sy;
+            b.x += sx;
+            b.y += sy;
             moved = true;
-          }
-          if (!this._isFixed(b)) {
-            b.x = Math.max(padding, Math.min(width - padding, b.x + sx));
-            b.y = Math.max(padding, Math.min(height - padding, b.y + sy));
+          } else if (aFixed && !bFixed) {
+            b.x += sx * 2;
+            b.y += sy * 2;
+            moved = true;
+          } else if (!aFixed && bFixed) {
+            a.x -= sx * 2;
+            a.y -= sy * 2;
             moved = true;
           }
         }
       }
+      nodes.forEach((node) => this._nudgeInside(node, width, height, padding));
       if (!moved) {
         break;
       }
+    }
+  }
+
+  _nudgeInside(node, width, height, padding) {
+    if (node.isCenter) {
+      return;
+    }
+    if (node.x < padding) {
+      node.x = padding + (padding - node.x) * 0.18;
+      node.vx = Math.abs(node.vx || 0) * 0.15;
+    } else if (node.x > width - padding) {
+      node.x = width - padding - (node.x - (width - padding)) * 0.18;
+      node.vx = -Math.abs(node.vx || 0) * 0.15;
+    }
+    if (node.y < padding) {
+      node.y = padding + (padding - node.y) * 0.18;
+      node.vy = Math.abs(node.vy || 0) * 0.15;
+    } else if (node.y > height - padding) {
+      node.y = height - padding - (node.y - (height - padding)) * 0.18;
+      node.vy = -Math.abs(node.vy || 0) * 0.15;
     }
   }
 

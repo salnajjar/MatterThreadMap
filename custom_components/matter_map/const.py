@@ -6,7 +6,7 @@ from pathlib import Path
 
 DOMAIN = "matter_map"
 NAME = "Matter Thread Map"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 PANEL_URL = "matter-thread-map"
 STATIC_PATH = "/matter_map_static"
 FRONTEND_DIR = Path(__file__).parent / "frontend"
