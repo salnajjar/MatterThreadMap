@@ -1,5 +1,7 @@
 # Matter Thread Map
 
+![Matter Thread Map logo](https://github.com/salnajjar/MatterThreadMap/blob/main/images/logo.png?raw=true)
+
 Matter Thread Map is a HACS custom integration for Home Assistant. It adds a sidebar panel that maps Matter devices connected over Thread, showing router-capable devices, visible Thread neighbors/routes, and link quality when devices expose it through the Matter Thread Network Diagnostics cluster.
 
 ## Current scope
