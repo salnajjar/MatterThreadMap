@@ -538,6 +538,12 @@ class MatterMapPanel extends HTMLElement {
       const isCenter = rawNode.id === graph.centerId;
       const fallback = this._fallbackPosition(index, Math.max(1, ordered.length - 1), isCenter, centerX, centerY);
       const state = this._stateFor(rawNode, fallback.x, fallback.y);
+      if (!isCenter && !state.pinned && this._isBadStoredPosition(state, graph.width, graph.height)) {
+        state.x = fallback.x;
+        state.y = fallback.y;
+        state.vx = 0;
+        state.vy = 0;
+      }
       const node = {
         ...rawNode,
         x: isCenter ? centerX : state.x,
@@ -615,10 +621,20 @@ class MatterMapPanel extends HTMLElement {
 
   _sizedGraph(nodeCount) {
     const graph = this._emptyGraph();
-    const radius = Math.max(320, 84 * Math.sqrt(Math.max(1, nodeCount)));
-    graph.width = Math.max(1200, Math.ceil(radius * 2 + 360));
-    graph.height = Math.max(800, Math.ceil(radius * 2 + 300));
+    const radius = Math.max(300, 70 * Math.sqrt(Math.max(1, nodeCount)));
+    graph.width = Math.max(1100, Math.ceil(radius * 2 + 300));
+    graph.height = Math.max(760, Math.ceil(radius * 2 + 260));
     return graph;
+  }
+
+  _isBadStoredPosition(state, width, height) {
+    const edgePadding = 120;
+    return (
+      state.x < edgePadding ||
+      state.y < edgePadding ||
+      state.x > width - edgePadding ||
+      state.y > height - edgePadding
+    );
   }
 
   _stateFor(node, fallbackX, fallbackY) {
@@ -763,7 +779,7 @@ class MatterMapPanel extends HTMLElement {
 
     this._applySpringForces(graph.links, alpha);
     this._applyRepulsion(graph.nodes, alpha);
-    this._applyCentering(graph.nodes, graph.width / 2, graph.height / 2, alpha);
+    this._applyContainment(graph.nodes, graph.width, graph.height, alpha);
     this._integrate(graph.nodes, graph.width, graph.height);
     this._persistGraphState(graph.nodes);
   }
@@ -801,7 +817,7 @@ class MatterMapPanel extends HTMLElement {
           continue;
         }
 
-        const charge = (a.isCenter || b.isCenter ? 4200 : 2300) * alpha;
+        const charge = (a.isCenter || b.isCenter ? 1500 : 720) * alpha;
         const force = charge / Math.max(distance * distance, 2200);
         this._pushNode(a, -dx * force, -dy * force);
         this._pushNode(b, dx * force, dy * force);
@@ -809,14 +825,29 @@ class MatterMapPanel extends HTMLElement {
     }
   }
 
-  _applyCentering(nodes, centerX, centerY, alpha) {
+  _applyContainment(nodes, width, height, alpha) {
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const softRadius = Math.min(width, height) * 0.34;
+    const hardRadius = Math.min(width, height) * 0.43;
+
     nodes.forEach((node) => {
       if (this._isFixed(node)) {
         return;
       }
-      const strength = node.degree ? 0.00016 : 0.00045;
-      node.vx += (centerX - node.x) * strength * alpha;
-      node.vy += (centerY - node.y) * strength * alpha;
+      const dx = node.x - centerX;
+      const dy = node.y - centerY;
+      const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+      const centerStrength = node.degree ? 0.00042 : 0.0011;
+      node.vx += (centerX - node.x) * centerStrength * alpha;
+      node.vy += (centerY - node.y) * centerStrength * alpha;
+
+      if (distance > softRadius) {
+        const excess = distance - softRadius;
+        const containment = Math.min(0.055, (excess / hardRadius) * 0.026) * alpha;
+        node.vx -= dx * containment;
+        node.vy -= dy * containment;
+      }
     });
   }
 
@@ -837,9 +868,8 @@ class MatterMapPanel extends HTMLElement {
       }
       node.vx *= 0.86;
       node.vy *= 0.86;
-      node.x += node.vx;
-      node.y += node.vy;
-      this._nudgeInside(node, width, height, padding);
+      node.x = Math.max(padding, Math.min(width - padding, node.x + node.vx));
+      node.y = Math.max(padding, Math.min(height - padding, node.y + node.vy));
     });
   }
 
@@ -918,18 +948,18 @@ class MatterMapPanel extends HTMLElement {
       return;
     }
     if (node.x < padding) {
-      node.x = padding + (padding - node.x) * 0.18;
-      node.vx = Math.abs(node.vx || 0) * 0.15;
+      node.x = padding;
+      node.vx = Math.abs(node.vx || 0) * 0.08;
     } else if (node.x > width - padding) {
-      node.x = width - padding - (node.x - (width - padding)) * 0.18;
-      node.vx = -Math.abs(node.vx || 0) * 0.15;
+      node.x = width - padding;
+      node.vx = -Math.abs(node.vx || 0) * 0.08;
     }
     if (node.y < padding) {
-      node.y = padding + (padding - node.y) * 0.18;
-      node.vy = Math.abs(node.vy || 0) * 0.15;
+      node.y = padding;
+      node.vy = Math.abs(node.vy || 0) * 0.08;
     } else if (node.y > height - padding) {
-      node.y = height - padding - (node.y - (height - padding)) * 0.18;
-      node.vy = -Math.abs(node.vy || 0) * 0.15;
+      node.y = height - padding;
+      node.vy = -Math.abs(node.vy || 0) * 0.08;
     }
   }
 
