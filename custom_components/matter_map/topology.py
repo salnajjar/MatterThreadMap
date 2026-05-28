@@ -146,7 +146,7 @@ def _add_neighbor_links(
             unresolved += 1
             continue
         rssi = _safe_get(neighbor, "averageRssi", "lastRssi")
-        lqi_in = _safe_get(neighbor, "lqiIn")
+        lqi_in = _safe_get(neighbor, "lqiIn", "lqi")
         quality = _quality_from_lqi_rssi(lqi_in, rssi)
         relationship = "child" if _safe_get(neighbor, "isChild") else "neighbor"
         _put_link(
@@ -184,7 +184,7 @@ def _add_route_links(
         if target_key is None or target_key == source_key:
             unresolved += 1
             continue
-        lqi_in = _safe_get(route, "lqiIn")
+        lqi_in = _safe_get(route, "lqiIn", "lqi")
         lqi_out = _safe_get(route, "lqiOut")
         path_cost = _safe_get(route, "pathCost")
         _put_link(
@@ -245,11 +245,13 @@ def _thread_aliases(thread_cluster: Any | None, mac_address: str | None) -> set[
     if thread_cluster is None:
         return aliases
 
-    for value in (
-        _safe_get(thread_cluster, "extendedAddress", "extAddress", "eui64"),
-        _safe_get(thread_cluster, "rloc16", "RLOC16"),
-        _safe_get(thread_cluster, "routerId", "routerID"),
-    ):
+    ext_address = _safe_get(thread_cluster, "extendedAddress", "extAddress", "eui64")
+    rloc16 = _safe_get(thread_cluster, "rloc16", "RLOC16")
+    router_id = _safe_get(thread_cluster, "routerId", "routerID")
+
+    for value in (ext_address, rloc16, router_id):
+        _add_alias(aliases, value)
+    for value in _router_aliases(rloc16, router_id):
         _add_alias(aliases, value)
     return aliases
 
@@ -267,9 +269,9 @@ def _resolve_thread_identity(
 ) -> str | None:
     """Resolve a Thread table identity to a paired Matter graph node."""
     for identity in identities:
-        normalized = _normalize_hex(identity)
-        if normalized and normalized in ids_by_thread_identity:
-            return ids_by_thread_identity[normalized]
+        for alias in _identity_aliases(identity):
+            if alias in ids_by_thread_identity:
+                return ids_by_thread_identity[alias]
     return None
 
 
@@ -279,6 +281,10 @@ def _neighbor_identities(neighbor: Any, index: int) -> tuple[Any, ...]:
         _safe_get(neighbor, "extAddress", "extendedAddress", "eui64"),
         _safe_get(neighbor, "rloc16", "RLOC16"),
         _safe_get(neighbor, "routerId", "routerID"),
+        *_router_aliases(
+            _safe_get(neighbor, "rloc16", "RLOC16"),
+            _safe_get(neighbor, "routerId", "routerID"),
+        ),
         f"neighbor-{index}",
     )
 
@@ -289,6 +295,10 @@ def _route_identities(route: Any, index: int) -> tuple[Any, ...]:
         _safe_get(route, "extAddress", "extendedAddress", "eui64"),
         _safe_get(route, "routerId", "routerID"),
         _safe_get(route, "rloc16", "RLOC16"),
+        *_router_aliases(
+            _safe_get(route, "rloc16", "RLOC16"),
+            _safe_get(route, "routerId", "routerID"),
+        ),
         f"route-{index}",
     )
 
@@ -362,9 +372,100 @@ def _normalize_hex(value: Any) -> str:
 
 def _add_alias(aliases: set[str], value: Any) -> None:
     """Add a normalized Thread identifier alias."""
+    aliases.update(_identity_aliases(value))
+
+
+def _identity_aliases(value: Any) -> set[str]:
+    """Return possible normalized aliases for a Thread identifier value."""
+    aliases: set[str] = set()
     normalized = _normalize_hex(value)
     if normalized:
         aliases.add(normalized)
+
+    int_value = _to_int(value)
+    if int_value is not None:
+        aliases.add(str(int_value))
+        aliases.add(f"{int_value:x}")
+        aliases.add(f"{int_value:04x}")
+        aliases.add(f"{int_value:016x}")
+        if int_value <= 0xFFFF:
+            aliases.add(str(int_value >> 10))
+            aliases.add(f"{int_value >> 10:x}")
+
+    hex_value = _hex_from_value(value)
+    if hex_value:
+        aliases.add(hex_value)
+        if len(hex_value) <= 4:
+            aliases.add(hex_value.zfill(4))
+        if len(hex_value) <= 16:
+            padded = hex_value.zfill(16)
+            aliases.add(padded)
+            aliases.add(_reverse_hex_bytes(padded))
+    return {alias for alias in aliases if alias}
+
+
+def _router_aliases(rloc16: Any, router_id: Any) -> tuple[Any, ...]:
+    """Return equivalent router identifiers derived from RLOC16/router ID."""
+    aliases: list[Any] = []
+    rloc16_int = _to_int(rloc16)
+    router_id_int = _to_int(router_id)
+    if rloc16_int is not None:
+        aliases.extend((rloc16_int, rloc16_int >> 10, (rloc16_int >> 10) << 10))
+    if router_id_int is not None:
+        aliases.extend((router_id_int, router_id_int << 10))
+    return tuple(aliases)
+
+
+def _to_int(value: Any) -> int | None:
+    """Convert common Matter SDK identifier values to int."""
+    if isinstance(value, bool) or value in (None, NullValue):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, bytes):
+        return int.from_bytes(value, "big")
+    if isinstance(value, str):
+        cleaned = _normalize_hex(value)
+        if not cleaned:
+            return None
+        try:
+            if any(char in "abcdef" for char in cleaned):
+                return int(cleaned, 16)
+            return int(cleaned, 10)
+        except ValueError:
+            return None
+    return None
+
+
+def _hex_from_value(value: Any) -> str | None:
+    """Return a hex string for identifiers that may arrive as bytes/int/string."""
+    if value in (None, NullValue) or isinstance(value, bool):
+        return None
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, int):
+        width = 4 if value <= 0xFFFF else 16
+        return f"{value:0{width}x}"
+    if isinstance(value, str):
+        cleaned = _normalize_hex(value)
+        if not cleaned:
+            return None
+        if any(char in "abcdef" for char in cleaned):
+            return cleaned
+        try:
+            int_value = int(cleaned, 10)
+        except ValueError:
+            return cleaned
+        width = 4 if int_value <= 0xFFFF else 16
+        return f"{int_value:0{width}x}"
+    return None
+
+
+def _reverse_hex_bytes(hex_value: str) -> str:
+    """Reverse a hex string by byte pairs for EUI64 byte-order variants."""
+    if len(hex_value) % 2:
+        return hex_value
+    return "".join(reversed([hex_value[index : index + 2] for index in range(0, len(hex_value), 2)]))
 
 
 def _node_key(node_id: int) -> str:
