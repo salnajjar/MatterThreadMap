@@ -16,6 +16,7 @@ class MatterMapPanel extends HTMLElement {
     this._activeGraph = undefined;
     this._dragMoveHandler = undefined;
     this._dragEndHandler = undefined;
+    this._pinned = new Set();
   }
 
   set hass(hass) {
@@ -484,6 +485,7 @@ class MatterMapPanel extends HTMLElement {
         y: position.y,
         vx: position.vx,
         vy: position.vy,
+        pinned: true,
         isCenter: true,
       });
     }
@@ -501,6 +503,7 @@ class MatterMapPanel extends HTMLElement {
         y: position.y,
         vx: position.vx,
         vy: position.vy,
+        pinned: this._pinned.has(node.id),
         isCenter: false,
       });
     });
@@ -509,7 +512,53 @@ class MatterMapPanel extends HTMLElement {
     const graphLinks = links
       .map((link) => ({ ...link, sourceNode: byId.get(link.source), targetNode: byId.get(link.target) }))
       .filter((link) => link.sourceNode && link.targetNode);
+    this._separateInitialOverlaps(graphNodes, width, height);
     return { width, height, nodes: graphNodes, links: graphLinks };
+  }
+
+  _separateInitialOverlaps(nodes, width, height) {
+    const padding = 56;
+    for (let pass = 0; pass < 16; pass += 1) {
+      let moved = false;
+      for (let i = 0; i < nodes.length; i += 1) {
+        for (let j = i + 1; j < nodes.length; j += 1) {
+          const a = nodes[i];
+          const b = nodes[j];
+          const dx = b.x - a.x || 0.01;
+          const dy = b.y - a.y || 0.01;
+          const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+          const minDistance = this._nodeRadius(a) + this._nodeRadius(b) + 38;
+          if (distance >= minDistance) {
+            continue;
+          }
+          const overlap = (minDistance - distance) / 2;
+          const pushX = (dx / distance) * overlap;
+          const pushY = (dy / distance) * overlap;
+          if (!this._isFixedNode(a)) {
+            a.x = Math.max(padding, Math.min(width - padding, a.x - pushX));
+            a.y = Math.max(padding, Math.min(height - padding, a.y - pushY));
+            moved = true;
+          }
+          if (!this._isFixedNode(b)) {
+            b.x = Math.max(padding, Math.min(width - padding, b.x + pushX));
+            b.y = Math.max(padding, Math.min(height - padding, b.y + pushY));
+            moved = true;
+          }
+        }
+      }
+      if (!moved) {
+        break;
+      }
+    }
+    nodes.forEach((node) => {
+      const position = this._positions.get(node.id);
+      if (position) {
+        position.x = node.x;
+        position.y = node.y;
+        position.vx = node.vx || 0;
+        position.vy = node.vy || 0;
+      }
+    });
   }
 
   _positionFor(node, fallbackX, fallbackY, isCenter) {
@@ -550,7 +599,7 @@ class MatterMapPanel extends HTMLElement {
         targetNode: nodeMap.get(link.target),
       }))
       .filter((link) => link.sourceNode && link.targetNode);
-    let energy = 1;
+    let energy = 1.15;
     let frame = 0;
 
     const tick = () => {
@@ -558,7 +607,7 @@ class MatterMapPanel extends HTMLElement {
       this._syncGraphDom(nodes, links);
       frame += 1;
       energy *= 0.985;
-      if (frame < 900 && energy > 0.015) {
+      if (frame < 1200 && energy > 0.006) {
         this._animationFrame = window.requestAnimationFrame(tick);
       } else {
         this._animationFrame = undefined;
@@ -579,16 +628,16 @@ class MatterMapPanel extends HTMLElement {
       const dx = target.x - source.x;
       const dy = target.y - source.y;
       const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-      const desired = source.isCenter || target.isCenter ? 185 : 135;
-      const strength = 0.018 * energy;
+      const desired = source.isCenter || target.isCenter ? 210 : 165;
+      const strength = 0.009 * energy;
       const pull = (distance - desired) * strength;
       const fx = (dx / distance) * pull;
       const fy = (dy / distance) * pull;
-      if (!source.isCenter && this._dragging !== source.id) {
+      if (!this._isFixedNode(source)) {
         source.vx += fx;
         source.vy += fy;
       }
-      if (!target.isCenter && this._dragging !== target.id) {
+      if (!this._isFixedNode(target)) {
         target.vx -= fx;
         target.vy -= fy;
       }
@@ -600,17 +649,21 @@ class MatterMapPanel extends HTMLElement {
         const b = nodes[j];
         const dx = b.x - a.x || 0.01;
         const dy = b.y - a.y || 0.01;
-        const distanceSq = Math.max(1200, dx * dx + dy * dy);
-        const force = (2100 / distanceSq) * energy;
-        const fx = dx * force;
-        const fy = dy * force;
-        if (!a.isCenter && this._dragging !== a.id) {
-          a.vx -= fx;
-          a.vy -= fy;
-        }
-        if (!b.isCenter && this._dragging !== b.id) {
-          b.vx += fx;
-          b.vy += fy;
+        const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+        const minDistance = this._nodeRadius(a) + this._nodeRadius(b) + 34;
+        if (distance < minDistance) {
+          const push = ((minDistance - distance) / distance) * 0.18 * energy;
+          const fx = dx * push;
+          const fy = dy * push;
+          this._applyNodeForce(a, -fx, -fy);
+          this._applyNodeForce(b, fx, fy);
+        } else {
+          const distanceSq = Math.max(1800, distance * distance);
+          const force = (1200 / distanceSq) * energy;
+          const fx = dx * force;
+          const fy = dy * force;
+          this._applyNodeForce(a, -fx, -fy);
+          this._applyNodeForce(b, fx, fy);
         }
       }
     }
@@ -624,14 +677,20 @@ class MatterMapPanel extends HTMLElement {
         this._positions.set(node.id, { x: node.x, y: node.y, vx: 0, vy: 0 });
         return;
       }
-      if (this._dragging === node.id) {
+      if (this._isFixedNode(node)) {
+        this._positions.set(node.id, {
+          x: node.x,
+          y: node.y,
+          vx: 0,
+          vy: 0,
+        });
         return;
       }
 
-      node.vx += (centerX - node.x) * 0.0008 * energy;
-      node.vy += (centerY - node.y) * 0.0008 * energy;
-      node.vx *= 0.88;
-      node.vy *= 0.88;
+      node.vx += (centerX - node.x) * 0.00018 * energy;
+      node.vy += (centerY - node.y) * 0.00018 * energy;
+      node.vx *= 0.91;
+      node.vy *= 0.91;
       node.x = Math.max(padding, Math.min(width - padding, node.x + node.vx));
       node.y = Math.max(padding, Math.min(height - padding, node.y + node.vy));
       this._positions.set(node.id, {
@@ -641,6 +700,31 @@ class MatterMapPanel extends HTMLElement {
         vy: node.vy,
       });
     });
+  }
+
+  _isFixedNode(node) {
+    return node.isCenter || node.pinned || this._dragging === node.id;
+  }
+
+  _applyNodeForce(node, fx, fy) {
+    if (this._isFixedNode(node)) {
+      return;
+    }
+    node.vx += fx;
+    node.vy += fy;
+  }
+
+  _nodeRadius(node) {
+    if (node.isCenter) {
+      return 34;
+    }
+    if (node.role && node.role.includes("routing")) {
+      return 28;
+    }
+    if (node.external) {
+      return 22;
+    }
+    return 24;
   }
 
   _syncGraphDom(nodes, links) {
@@ -754,13 +838,19 @@ class MatterMapPanel extends HTMLElement {
     if (!this._dragging) {
       return;
     }
+    const draggedId = this._dragging;
     this._dragging = undefined;
+    this._pinned.add(draggedId);
     if (this._dragMoveHandler) {
       window.removeEventListener("pointermove", this._dragMoveHandler);
       this._dragMoveHandler = undefined;
     }
     this._dragEndHandler = undefined;
     if (this._activeGraph) {
+      const graphNode = this._activeGraph.nodes.find((node) => node.id === draggedId);
+      if (graphNode) {
+        graphNode.pinned = true;
+      }
       this._startSimulation(this._activeGraph);
     }
   }
@@ -809,6 +899,7 @@ class MatterMapPanel extends HTMLElement {
       graphNode.y = y;
       graphNode.vx = 0;
       graphNode.vy = 0;
+      graphNode.pinned = true;
       this._syncGraphDom(graph.nodes, graph.links);
     }
   }
