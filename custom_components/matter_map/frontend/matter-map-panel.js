@@ -8,15 +8,13 @@ class MatterMapPanel extends HTMLElement {
     this._error = "";
     this._selected = undefined;
     this._timer = undefined;
-    this._positions = new Map();
-    this._animationFrame = undefined;
-    this._dragging = undefined;
-    this._panning = undefined;
+    this._frame = undefined;
+    this._graph = this._emptyGraph();
+    this._state = new Map();
     this._view = { x: 0, y: 0, scale: 1 };
-    this._activeGraph = undefined;
-    this._dragMoveHandler = undefined;
-    this._dragEndHandler = undefined;
-    this._pinned = new Set();
+    this._drag = undefined;
+    this._suppressClick = false;
+    this._pan = undefined;
   }
 
   set hass(hass) {
@@ -31,7 +29,7 @@ class MatterMapPanel extends HTMLElement {
   }
 
   connectedCallback() {
-    this._render();
+    this._renderShell();
     this._loadTopology();
     this._timer = window.setInterval(() => this._loadTopology(true), 30000);
   }
@@ -41,27 +39,23 @@ class MatterMapPanel extends HTMLElement {
       window.clearInterval(this._timer);
       this._timer = undefined;
     }
-    if (this._animationFrame) {
-      window.cancelAnimationFrame(this._animationFrame);
-      this._animationFrame = undefined;
-    }
-    if (this._dragMoveHandler) {
-      window.removeEventListener("pointermove", this._dragMoveHandler);
-      this._dragMoveHandler = undefined;
-    }
+    this._stopSimulation();
+    this._removeWindowDragHandlers();
   }
 
   async _loadTopology(quiet = false) {
     if (!this._hass) {
       this._loading = false;
-      this._render();
+      this._renderShell();
       return;
     }
+
     if (!quiet) {
       this._loading = true;
       this._error = "";
-      this._render();
+      this._renderShell();
     }
+
     try {
       this._topology = await this._hass.callWS({ type: "matter_map/get_topology" });
       this._error = "";
@@ -69,14 +63,14 @@ class MatterMapPanel extends HTMLElement {
       this._error = err && err.message ? err.message : "Unable to load topology";
     } finally {
       this._loading = false;
-      this._render();
+      this._renderShell();
     }
   }
 
-  _render() {
+  _renderShell() {
     const topology = this._topology || { nodes: [], links: [], summary: {} };
-    const graph = this._layoutGraph(topology.nodes, topology.links);
     const selected = topology.nodes.find((node) => node.id === this._selected);
+    this._graph = this._buildGraph(topology.nodes, topology.links);
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -84,8 +78,8 @@ class MatterMapPanel extends HTMLElement {
           display: block;
           height: 100vh;
           height: 100dvh;
-          overflow: hidden;
           min-height: 100vh;
+          overflow: hidden;
           color: var(--primary-text-color);
           background: var(--primary-background-color);
           font-family: var(--paper-font-body1_-_font-family, Roboto, Arial, sans-serif);
@@ -137,7 +131,7 @@ class MatterMapPanel extends HTMLElement {
         }
         main {
           display: grid;
-          grid-template-columns: minmax(0, 1fr) 320px;
+          grid-template-columns: minmax(0, 1fr) 340px;
           min-height: 0;
           overflow: hidden;
         }
@@ -156,6 +150,7 @@ class MatterMapPanel extends HTMLElement {
           min-height: 0;
           display: block;
           cursor: grab;
+          touch-action: none;
         }
         svg.panning {
           cursor: grabbing;
@@ -165,12 +160,17 @@ class MatterMapPanel extends HTMLElement {
         }
         .link {
           stroke-linecap: round;
-          opacity: 0.88;
+          opacity: 0.84;
+          pointer-events: none;
         }
         .link-label {
           fill: var(--secondary-text-color);
           font-size: 11px;
           pointer-events: none;
+        }
+        .node {
+          cursor: pointer;
+          touch-action: none;
         }
         .node circle {
           stroke-width: 3px;
@@ -191,15 +191,15 @@ class MatterMapPanel extends HTMLElement {
           fill: var(--secondary-text-color);
           font-size: 10px;
         }
-        .node {
-          cursor: pointer;
-          touch-action: none;
-        }
         .node.selected circle {
           stroke: var(--accent-color);
+          stroke-width: 4px;
         }
         .node.center circle {
           stroke: var(--warning-color, #f39c12);
+        }
+        .node.pinned circle {
+          stroke-dasharray: 3 3;
         }
         aside {
           border-left: 1px solid var(--divider-color);
@@ -250,7 +250,7 @@ class MatterMapPanel extends HTMLElement {
         }
         dl {
           display: grid;
-          grid-template-columns: 110px minmax(0, 1fr);
+          grid-template-columns: 112px minmax(0, 1fr);
           gap: 8px 12px;
           margin: 0;
           font-size: 13px;
@@ -299,12 +299,13 @@ class MatterMapPanel extends HTMLElement {
         .banner {
           position: absolute;
           inset: 18px auto auto 18px;
-          max-width: min(520px, calc(100% - 36px));
+          max-width: min(560px, calc(100% - 36px));
           padding: 12px 14px;
           border-radius: 6px;
           background: var(--card-background-color);
           border: 1px solid var(--divider-color);
           box-shadow: var(--ha-card-box-shadow, 0 2px 8px rgba(0,0,0,.16));
+          z-index: 1;
         }
         .map-controls {
           position: absolute;
@@ -312,11 +313,11 @@ class MatterMapPanel extends HTMLElement {
           top: 18px;
           display: flex;
           gap: 8px;
-          z-index: 1;
+          z-index: 2;
         }
         .map-controls button {
-          width: 36px;
-          min-width: 36px;
+          width: 38px;
+          min-width: 38px;
           padding: 0;
           font-size: 18px;
           line-height: 1;
@@ -368,10 +369,10 @@ class MatterMapPanel extends HTMLElement {
               <button id="zoom-out" title="Zoom out">-</button>
               <button id="zoom-reset" title="Reset map view">1:1</button>
             </div>
-            <svg viewBox="0 0 ${graph.width} ${graph.height}" role="img" aria-label="Matter Thread network graph">
+            <svg viewBox="0 0 ${this._graph.width} ${this._graph.height}" role="img" aria-label="Matter Thread network graph">
               <g class="viewport">
-                ${graph.links.map((link) => this._linkSvg(link)).join("")}
-                ${graph.nodes.map((node) => this._nodeSvg(node)).join("")}
+                <g class="link-layer"></g>
+                <g class="node-layer"></g>
               </g>
             </svg>
           </section>
@@ -382,19 +383,30 @@ class MatterMapPanel extends HTMLElement {
               <div class="metric"><strong>${topology.summary.links || 0}</strong><span>Links</span></div>
               <div class="metric"><strong>${topology.summary.partial_errors || 0}</strong><span>Read errors</span></div>
             </div>
-            ${selected ? this._details(selected, topology.nodes, topology.links) : '<p class="empty">Select a node to inspect its role and links.</p>'}
+            <div class="details-pane">
+              ${selected ? this._details(selected, topology.nodes, topology.links) : '<p class="empty">Select a node to inspect its role and links.</p>'}
+            </div>
           </aside>
         </main>
       </div>
     `;
 
+    this._bindShellEvents();
+    this._renderGraph();
+    this._applyViewTransform();
+    this._startSimulation();
+  }
+
+  _bindShellEvents() {
     const refreshButton = this.shadowRoot.getElementById("refresh");
-    if (refreshButton) {
-      refreshButton.addEventListener("click", () => this._loadTopology());
-    }
     const zoomIn = this.shadowRoot.getElementById("zoom-in");
     const zoomOut = this.shadowRoot.getElementById("zoom-out");
     const zoomReset = this.shadowRoot.getElementById("zoom-reset");
+    const svg = this.shadowRoot.querySelector("svg");
+
+    if (refreshButton) {
+      refreshButton.addEventListener("click", () => this._loadTopology());
+    }
     if (zoomIn) {
       zoomIn.addEventListener("click", () => this._zoomBy(1.2));
     }
@@ -404,22 +416,73 @@ class MatterMapPanel extends HTMLElement {
     if (zoomReset) {
       zoomReset.addEventListener("click", () => this._resetView());
     }
-    this.shadowRoot.querySelectorAll(".node").forEach((node) => {
-      node.addEventListener("click", () => {
-        this._selected = node.getAttribute("data-node-id");
-        this._render();
+    if (!svg) {
+      return;
+    }
+
+    svg.addEventListener("wheel", (event) => this._onWheel(event), { passive: false });
+    svg.addEventListener("pointerdown", (event) => this._onSvgPointerDown(event));
+    svg.addEventListener("pointermove", (event) => this._onSvgPointerMove(event));
+    svg.addEventListener("pointerup", () => this._endPan());
+    svg.addEventListener("pointerleave", () => this._endPan());
+  }
+
+  _renderGraph() {
+    const linkLayer = this.shadowRoot.querySelector(".link-layer");
+    const nodeLayer = this.shadowRoot.querySelector(".node-layer");
+    if (!linkLayer || !nodeLayer) {
+      return;
+    }
+
+    linkLayer.innerHTML = this._graph.links.map((link) => this._linkSvg(link)).join("");
+    nodeLayer.innerHTML = this._graph.nodes.map((node) => this._nodeSvg(node)).join("");
+
+    this.shadowRoot.querySelectorAll(".node").forEach((element) => {
+      element.addEventListener("click", (event) => {
+        if (this._suppressClick) {
+          this._suppressClick = false;
+          return;
+        }
+        this._selectNode(element.getAttribute("data-node-id"));
+        event.stopPropagation();
       });
-      node.addEventListener("pointerdown", (event) => this._startDrag(event, node));
+      element.addEventListener("pointerdown", (event) => this._startNodeDrag(event, element));
     });
-    this.shadowRoot.querySelectorAll(".connected-node").forEach((node) => {
-      node.addEventListener("click", () => {
-        this._selected = node.getAttribute("data-node-id");
-        this._render();
-      });
+
+    this.shadowRoot.querySelectorAll(".connected-node").forEach((element) => {
+      element.addEventListener("click", () => this._selectNode(element.getAttribute("data-node-id")));
     });
-    this._bindGraphPointerEvents(graph);
-    this._applyViewTransform();
-    this._startSimulation(graph);
+
+    this._syncGraphDom();
+  }
+
+  _selectNode(nodeId) {
+    this._selected = nodeId;
+    this._updateSelectedClasses();
+    this._renderDetailsPane();
+  }
+
+  _renderDetailsPane() {
+    const pane = this.shadowRoot.querySelector(".details-pane");
+    if (!pane) {
+      return;
+    }
+    const topology = this._topology || { nodes: [], links: [] };
+    const selected = topology.nodes.find((node) => node.id === this._selected);
+    pane.innerHTML = selected ? this._details(selected, topology.nodes, topology.links) : '<p class="empty">Select a node to inspect its role and links.</p>';
+    pane.querySelectorAll(".connected-node").forEach((element) => {
+      element.addEventListener("click", () => this._selectNode(element.getAttribute("data-node-id")));
+    });
+  }
+
+  _updateSelectedClasses() {
+    this.shadowRoot.querySelectorAll(".node").forEach((element) => {
+      if (element.getAttribute("data-node-id") === this._selected) {
+        element.classList.add("selected");
+      } else {
+        element.classList.remove("selected");
+      }
+    });
   }
 
   _subtitle(topology) {
@@ -449,13 +512,102 @@ class MatterMapPanel extends HTMLElement {
     return "";
   }
 
-  _layoutGraph(nodes, links) {
-    const width = 1120;
-    const height = 720;
-    const centerX = width / 2;
-    const centerY = height / 2;
-    const centerNode = this._chooseCenterNode(nodes, links);
-    const centerId = centerNode ? centerNode.id : undefined;
+  _emptyGraph() {
+    return {
+      width: 1200,
+      height: 760,
+      nodes: [],
+      links: [],
+      nodeById: new Map(),
+      centerId: undefined,
+      alpha: 0,
+    };
+  }
+
+  _buildGraph(rawNodes, rawLinks) {
+    const graph = this._emptyGraph();
+    const centerNode = this._chooseCenterNode(rawNodes, rawLinks);
+    graph.centerId = centerNode ? centerNode.id : undefined;
+
+    const degrees = this._degrees(rawLinks);
+    const centerX = graph.width / 2;
+    const centerY = graph.height / 2;
+    const ordered = this._orderedNodes(rawNodes, rawLinks, graph.centerId);
+
+    ordered.forEach((rawNode, index) => {
+      const isCenter = rawNode.id === graph.centerId;
+      const fallback = this._fallbackPosition(index, Math.max(1, ordered.length - 1), isCenter, centerX, centerY);
+      const state = this._stateFor(rawNode, fallback.x, fallback.y);
+      const node = {
+        ...rawNode,
+        x: isCenter ? centerX : state.x,
+        y: isCenter ? centerY : state.y,
+        vx: state.vx || 0,
+        vy: state.vy || 0,
+        radius: this._nodeRadius(rawNode, isCenter),
+        isCenter,
+        pinned: isCenter || state.pinned,
+        degree: degrees.get(rawNode.id) || 0,
+      };
+      if (isCenter) {
+        state.x = centerX;
+        state.y = centerY;
+        state.vx = 0;
+        state.vy = 0;
+        state.pinned = true;
+      }
+      graph.nodes.push(node);
+      graph.nodeById.set(node.id, node);
+    });
+
+    graph.links = rawLinks
+      .map((rawLink) => {
+        const source = graph.nodeById.get(rawLink.source);
+        const target = graph.nodeById.get(rawLink.target);
+        if (!source || !target) {
+          return undefined;
+        }
+        const preferredDistance = source.isCenter || target.isCenter ? 230 : 175;
+        return {
+          ...rawLink,
+          sourceNode: source,
+          targetNode: target,
+          preferredDistance,
+        };
+      })
+      .filter((link) => Boolean(link));
+
+    this._resolveCollisions(graph.nodes, graph.width, graph.height, 28);
+    this._persistGraphState(graph.nodes);
+    graph.alpha = 1;
+    return graph;
+  }
+
+  _stateFor(node, fallbackX, fallbackY) {
+    let state = this._state.get(node.id);
+    if (!state) {
+      state = {
+        x: fallbackX,
+        y: fallbackY,
+        vx: 0,
+        vy: 0,
+        pinned: false,
+      };
+      this._state.set(node.id, state);
+    }
+    return state;
+  }
+
+  _degrees(links) {
+    const degrees = new Map();
+    links.forEach((link) => {
+      degrees.set(link.source, (degrees.get(link.source) || 0) + 1);
+      degrees.set(link.target, (degrees.get(link.target) || 0) + 1);
+    });
+    return degrees;
+  }
+
+  _orderedNodes(nodes, links, centerId) {
     const directIds = new Set();
     links.forEach((link) => {
       if (link.source === centerId) {
@@ -465,60 +617,189 @@ class MatterMapPanel extends HTMLElement {
         directIds.add(link.source);
       }
     });
-
-    const direct = nodes.filter((node) => node.id !== centerId && directIds.has(node.id));
-    const indirect = nodes.filter((node) => node.id !== centerId && !directIds.has(node.id));
-    const ordered = [
-      ...direct.filter((node) => node.role.includes("routing") || node.external),
-      ...direct.filter((node) => !node.role.includes("routing") && !node.external),
-      ...indirect.filter((node) => node.role.includes("routing") || node.external),
-      ...indirect.filter((node) => !node.role.includes("routing") && !node.external),
-    ];
-    const baseRadius = Math.min(width, height) * 0.3;
-    const graphNodes = [];
-
-    if (centerNode) {
-      const position = this._positionFor(centerNode, centerX, centerY, true);
-      graphNodes.push({
-        ...centerNode,
-        x: position.x,
-        y: position.y,
-        vx: position.vx,
-        vy: position.vy,
-        pinned: true,
-        isCenter: true,
-      });
-    }
-
-    ordered.forEach((node, index) => {
-      const angle = ordered.length ? (Math.PI * 2 * index) / ordered.length - Math.PI / 2 : 0;
-      const ring = directIds.has(node.id) ? baseRadius : baseRadius * 1.38;
-      const stagger = index % 2 === 0 ? 0 : 18;
-      const fallbackX = centerX + Math.cos(angle) * (ring + stagger);
-      const fallbackY = centerY + Math.sin(angle) * (ring + stagger);
-      const position = this._positionFor(node, fallbackX, fallbackY, false);
-      graphNodes.push({
-        ...node,
-        x: position.x,
-        y: position.y,
-        vx: position.vx,
-        vy: position.vy,
-        pinned: this._pinned.has(node.id),
-        isCenter: false,
-      });
+    return [...nodes].sort((a, b) => {
+      if (a.id === centerId) {
+        return -1;
+      }
+      if (b.id === centerId) {
+        return 1;
+      }
+      const aDirect = directIds.has(a.id) ? 0 : 1;
+      const bDirect = directIds.has(b.id) ? 0 : 1;
+      if (aDirect !== bDirect) {
+        return aDirect - bDirect;
+      }
+      const aRouter = a.role && a.role.includes("routing") ? 0 : 1;
+      const bRouter = b.role && b.role.includes("routing") ? 0 : 1;
+      if (aRouter !== bRouter) {
+        return aRouter - bRouter;
+      }
+      return String(a.label || a.id).localeCompare(String(b.label || b.id));
     });
-
-    const byId = new Map(graphNodes.map((node) => [node.id, node]));
-    const graphLinks = links
-      .map((link) => ({ ...link, sourceNode: byId.get(link.source), targetNode: byId.get(link.target) }))
-      .filter((link) => link.sourceNode && link.targetNode);
-    this._separateInitialOverlaps(graphNodes, width, height);
-    return { width, height, nodes: graphNodes, links: graphLinks };
   }
 
-  _separateInitialOverlaps(nodes, width, height) {
-    const padding = 56;
-    for (let pass = 0; pass < 16; pass += 1) {
+  _fallbackPosition(index, count, isCenter, centerX, centerY) {
+    if (isCenter) {
+      return { x: centerX, y: centerY };
+    }
+    const ringIndex = Math.floor((index - 1) / 10);
+    const ringPosition = (index - 1) % 10;
+    const ringCount = Math.min(10, count);
+    const angle = (Math.PI * 2 * ringPosition) / ringCount - Math.PI / 2 + ringIndex * 0.33;
+    const radius = 215 + ringIndex * 120;
+    return {
+      x: centerX + Math.cos(angle) * radius,
+      y: centerY + Math.sin(angle) * radius,
+    };
+  }
+
+  _startSimulation() {
+    this._stopSimulation();
+    if (!this._graph.nodes.length) {
+      return;
+    }
+    this._graph.alpha = Math.max(this._graph.alpha, 0.9);
+    const step = () => {
+      this._tick();
+      this._syncGraphDom();
+      this._graph.alpha *= 0.982;
+      if (this._graph.alpha > 0.004 || this._drag) {
+        this._frame = window.requestAnimationFrame(step);
+      } else {
+        this._frame = undefined;
+      }
+    };
+    this._frame = window.requestAnimationFrame(step);
+  }
+
+  _stopSimulation() {
+    if (this._frame) {
+      window.cancelAnimationFrame(this._frame);
+      this._frame = undefined;
+    }
+  }
+
+  _wakeSimulation(alpha) {
+    this._graph.alpha = Math.max(this._graph.alpha, alpha || 0.45);
+    if (!this._frame) {
+      this._startSimulation();
+    }
+  }
+
+  _tick() {
+    const graph = this._graph;
+    const alpha = graph.alpha;
+
+    this._applySpringForces(graph.links, alpha);
+    this._applyRepulsion(graph.nodes, alpha);
+    this._applyCentering(graph.nodes, graph.width / 2, graph.height / 2, alpha);
+    this._integrate(graph.nodes, graph.width, graph.height);
+    this._persistGraphState(graph.nodes);
+  }
+
+  _applySpringForces(links, alpha) {
+    links.forEach((link) => {
+      const source = link.sourceNode;
+      const target = link.targetNode;
+      const dx = target.x - source.x || 0.01;
+      const dy = target.y - source.y || 0.01;
+      const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+      const strength = (source.isCenter || target.isCenter ? 0.018 : 0.012) * alpha;
+      const force = (distance - link.preferredDistance) * strength;
+      const fx = (dx / distance) * force;
+      const fy = (dy / distance) * force;
+      this._pushNode(source, fx, fy);
+      this._pushNode(target, -fx, -fy);
+    });
+  }
+
+  _applyRepulsion(nodes, alpha) {
+    for (let i = 0; i < nodes.length; i += 1) {
+      for (let j = i + 1; j < nodes.length; j += 1) {
+        const a = nodes[i];
+        const b = nodes[j];
+        const dx = b.x - a.x || 0.01;
+        const dy = b.y - a.y || 0.01;
+        const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+        const minDistance = a.radius + b.radius + 52;
+
+        if (distance < minDistance) {
+          const overlap = (minDistance - distance) / distance;
+          const force = overlap * 0.42 * alpha;
+          this._separatePair(a, b, dx * force, dy * force);
+          continue;
+        }
+
+        const charge = (a.isCenter || b.isCenter ? 4200 : 2300) * alpha;
+        const force = charge / Math.max(distance * distance, 2200);
+        this._pushNode(a, -dx * force, -dy * force);
+        this._pushNode(b, dx * force, dy * force);
+      }
+    }
+  }
+
+  _applyCentering(nodes, centerX, centerY, alpha) {
+    nodes.forEach((node) => {
+      if (this._isFixed(node)) {
+        return;
+      }
+      const strength = node.degree ? 0.00016 : 0.00045;
+      node.vx += (centerX - node.x) * strength * alpha;
+      node.vy += (centerY - node.y) * strength * alpha;
+    });
+  }
+
+  _integrate(nodes, width, height) {
+    const padding = 72;
+    nodes.forEach((node) => {
+      if (node.isCenter) {
+        node.x = width / 2;
+        node.y = height / 2;
+        node.vx = 0;
+        node.vy = 0;
+        return;
+      }
+      if (node.pinned || (this._drag && this._drag.id === node.id)) {
+        node.vx = 0;
+        node.vy = 0;
+        return;
+      }
+      node.vx *= 0.86;
+      node.vy *= 0.86;
+      node.x = Math.max(padding, Math.min(width - padding, node.x + node.vx));
+      node.y = Math.max(padding, Math.min(height - padding, node.y + node.vy));
+    });
+  }
+
+  _pushNode(node, fx, fy) {
+    if (this._isFixed(node)) {
+      return;
+    }
+    node.vx += fx;
+    node.vy += fy;
+  }
+
+  _separatePair(a, b, fx, fy) {
+    const aFixed = this._isFixed(a);
+    const bFixed = this._isFixed(b);
+    if (aFixed && bFixed) {
+      return;
+    }
+    if (aFixed) {
+      this._pushNode(b, fx * 2, fy * 2);
+      return;
+    }
+    if (bFixed) {
+      this._pushNode(a, -fx * 2, -fy * 2);
+      return;
+    }
+    this._pushNode(a, -fx, -fy);
+    this._pushNode(b, fx, fy);
+  }
+
+  _resolveCollisions(nodes, width, height, passes) {
+    const padding = 72;
+    for (let pass = 0; pass < passes; pass += 1) {
       let moved = false;
       for (let i = 0; i < nodes.length; i += 1) {
         for (let j = i + 1; j < nodes.length; j += 1) {
@@ -527,21 +808,21 @@ class MatterMapPanel extends HTMLElement {
           const dx = b.x - a.x || 0.01;
           const dy = b.y - a.y || 0.01;
           const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-          const minDistance = this._nodeRadius(a) + this._nodeRadius(b) + 38;
+          const minDistance = a.radius + b.radius + 56;
           if (distance >= minDistance) {
             continue;
           }
-          const overlap = (minDistance - distance) / 2;
-          const pushX = (dx / distance) * overlap;
-          const pushY = (dy / distance) * overlap;
-          if (!this._isFixedNode(a)) {
-            a.x = Math.max(padding, Math.min(width - padding, a.x - pushX));
-            a.y = Math.max(padding, Math.min(height - padding, a.y - pushY));
+          const shift = (minDistance - distance) / distance;
+          const sx = dx * shift * 0.55;
+          const sy = dy * shift * 0.55;
+          if (!this._isFixed(a)) {
+            a.x = Math.max(padding, Math.min(width - padding, a.x - sx));
+            a.y = Math.max(padding, Math.min(height - padding, a.y - sy));
             moved = true;
           }
-          if (!this._isFixedNode(b)) {
-            b.x = Math.max(padding, Math.min(width - padding, b.x + pushX));
-            b.y = Math.max(padding, Math.min(height - padding, b.y + pushY));
+          if (!this._isFixed(b)) {
+            b.x = Math.max(padding, Math.min(width - padding, b.x + sx));
+            b.y = Math.max(padding, Math.min(height - padding, b.y + sy));
             moved = true;
           }
         }
@@ -550,195 +831,43 @@ class MatterMapPanel extends HTMLElement {
         break;
       }
     }
+  }
+
+  _isFixed(node) {
+    return node.isCenter || node.pinned || Boolean(this._drag && this._drag.id === node.id);
+  }
+
+  _persistGraphState(nodes) {
     nodes.forEach((node) => {
-      const position = this._positions.get(node.id);
-      if (position) {
-        position.x = node.x;
-        position.y = node.y;
-        position.vx = node.vx || 0;
-        position.vy = node.vy || 0;
-      }
+      const state = this._stateFor(node, node.x, node.y);
+      state.x = node.x;
+      state.y = node.y;
+      state.vx = node.vx || 0;
+      state.vy = node.vy || 0;
+      state.pinned = Boolean(node.pinned);
     });
   }
 
-  _positionFor(node, fallbackX, fallbackY, isCenter) {
-    let position = this._positions.get(node.id);
-    if (!position) {
-      position = {
-        x: fallbackX,
-        y: fallbackY,
-        vx: 0,
-        vy: 0,
-      };
-      this._positions.set(node.id, position);
-    }
-    if (isCenter) {
-      position.x = fallbackX;
-      position.y = fallbackY;
-      position.vx = 0;
-      position.vy = 0;
-    }
-    return position;
-  }
-
-  _startSimulation(graph) {
-    if (this._animationFrame) {
-      window.cancelAnimationFrame(this._animationFrame);
-      this._animationFrame = undefined;
-    }
-    if (!graph.nodes.length) {
-      return;
-    }
-
-    const nodes = graph.nodes.map((node) => ({ ...node }));
-    const nodeMap = new Map(nodes.map((node) => [node.id, node]));
-    const links = graph.links
-      .map((link) => ({
-        ...link,
-        sourceNode: nodeMap.get(link.source),
-        targetNode: nodeMap.get(link.target),
-      }))
-      .filter((link) => link.sourceNode && link.targetNode);
-    let energy = 1.15;
-    let frame = 0;
-
-    const tick = () => {
-      this._simulateForces(nodes, links, graph.width, graph.height, energy);
-      this._syncGraphDom(nodes, links);
-      frame += 1;
-      energy *= 0.985;
-      if (frame < 1200 && energy > 0.006) {
-        this._animationFrame = window.requestAnimationFrame(tick);
-      } else {
-        this._animationFrame = undefined;
-      }
-    };
-
-    this._animationFrame = window.requestAnimationFrame(tick);
-  }
-
-  _simulateForces(nodes, links, width, height, energy) {
-    const centerX = width / 2;
-    const centerY = height / 2;
-    const padding = 56;
-
-    links.forEach((link) => {
-      const source = link.sourceNode;
-      const target = link.targetNode;
-      const dx = target.x - source.x;
-      const dy = target.y - source.y;
-      const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-      const desired = source.isCenter || target.isCenter ? 210 : 165;
-      const strength = 0.009 * energy;
-      const pull = (distance - desired) * strength;
-      const fx = (dx / distance) * pull;
-      const fy = (dy / distance) * pull;
-      if (!this._isFixedNode(source)) {
-        source.vx += fx;
-        source.vy += fy;
-      }
-      if (!this._isFixedNode(target)) {
-        target.vx -= fx;
-        target.vy -= fy;
-      }
-    });
-
-    for (let i = 0; i < nodes.length; i += 1) {
-      for (let j = i + 1; j < nodes.length; j += 1) {
-        const a = nodes[i];
-        const b = nodes[j];
-        const dx = b.x - a.x || 0.01;
-        const dy = b.y - a.y || 0.01;
-        const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-        const minDistance = this._nodeRadius(a) + this._nodeRadius(b) + 34;
-        if (distance < minDistance) {
-          const push = ((minDistance - distance) / distance) * 0.18 * energy;
-          const fx = dx * push;
-          const fy = dy * push;
-          this._applyNodeForce(a, -fx, -fy);
-          this._applyNodeForce(b, fx, fy);
-        } else {
-          const distanceSq = Math.max(1800, distance * distance);
-          const force = (1200 / distanceSq) * energy;
-          const fx = dx * force;
-          const fy = dy * force;
-          this._applyNodeForce(a, -fx, -fy);
-          this._applyNodeForce(b, fx, fy);
-        }
-      }
-    }
-
-    nodes.forEach((node) => {
-      if (node.isCenter) {
-        node.x = centerX;
-        node.y = centerY;
-        node.vx = 0;
-        node.vy = 0;
-        this._positions.set(node.id, { x: node.x, y: node.y, vx: 0, vy: 0 });
-        return;
-      }
-      if (this._isFixedNode(node)) {
-        this._positions.set(node.id, {
-          x: node.x,
-          y: node.y,
-          vx: 0,
-          vy: 0,
-        });
-        return;
-      }
-
-      node.vx += (centerX - node.x) * 0.00018 * energy;
-      node.vy += (centerY - node.y) * 0.00018 * energy;
-      node.vx *= 0.91;
-      node.vy *= 0.91;
-      node.x = Math.max(padding, Math.min(width - padding, node.x + node.vx));
-      node.y = Math.max(padding, Math.min(height - padding, node.y + node.vy));
-      this._positions.set(node.id, {
-        x: node.x,
-        y: node.y,
-        vx: node.vx,
-        vy: node.vy,
-      });
-    });
-  }
-
-  _isFixedNode(node) {
-    return node.isCenter || node.pinned || this._dragging === node.id;
-  }
-
-  _applyNodeForce(node, fx, fy) {
-    if (this._isFixedNode(node)) {
-      return;
-    }
-    node.vx += fx;
-    node.vy += fy;
-  }
-
-  _nodeRadius(node) {
-    if (node.isCenter) {
-      return 34;
-    }
-    if (node.role && node.role.includes("routing")) {
-      return 28;
-    }
-    if (node.external) {
-      return 22;
-    }
-    return 24;
-  }
-
-  _syncGraphDom(nodes, links) {
+  _syncGraphDom() {
     const root = this.shadowRoot;
-    nodes.forEach((node) => {
+    this._graph.nodes.forEach((node) => {
       const element = root.querySelector(`.node[data-node-id="${this._selectorEscape(node.id)}"]`);
-      if (element) {
-        element.setAttribute("transform", `translate(${node.x}, ${node.y})`);
+      if (!element) {
+        return;
+      }
+      element.setAttribute("transform", `translate(${node.x}, ${node.y})`);
+      if (node.pinned && !node.isCenter) {
+        element.classList.add("pinned");
+      } else {
+        element.classList.remove("pinned");
       }
     });
-    links.forEach((link) => {
+    this._graph.links.forEach((link) => {
       const linkId = this._selectorEscape(link.id);
       const line = root.querySelector(`.link[data-link-id="${linkId}"]`);
       const label = root.querySelector(`.link-label[data-link-id="${linkId}"]`);
+      const midX = (link.sourceNode.x + link.targetNode.x) / 2;
+      const midY = (link.sourceNode.y + link.targetNode.y) / 2;
       if (line) {
         line.setAttribute("x1", link.sourceNode.x);
         line.setAttribute("y1", link.sourceNode.y);
@@ -746,116 +875,201 @@ class MatterMapPanel extends HTMLElement {
         line.setAttribute("y2", link.targetNode.y);
       }
       if (label) {
-        label.setAttribute("x", (link.sourceNode.x + link.targetNode.x) / 2);
-        label.setAttribute("y", (link.sourceNode.y + link.targetNode.y) / 2 - 8);
+        label.setAttribute("x", midX);
+        label.setAttribute("y", midY - 8);
       }
     });
   }
 
-  _bindGraphPointerEvents(graph) {
+  _onWheel(event) {
     const svg = this.shadowRoot.querySelector("svg");
     if (!svg) {
       return;
     }
-    this._activeGraph = graph;
-    svg.addEventListener("wheel", (event) => {
-      const zoomFactor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
-      const point = this._eventToRawSvgPoint(svg, event);
-      this._zoomAt(zoomFactor, point.x, point.y);
-      event.preventDefault();
-    }, { passive: false });
-    svg.addEventListener("pointerdown", (event) => {
-      if (event.target.closest && event.target.closest(".node")) {
-        return;
-      }
-      this._panning = {
-        pointerId: event.pointerId,
-        startX: event.clientX,
-        startY: event.clientY,
-        viewX: this._view.x,
-        viewY: this._view.y,
-        width: graph.width,
-        height: graph.height,
-      };
-      svg.classList.add("panning");
-      if (svg.setPointerCapture) {
-        svg.setPointerCapture(event.pointerId);
-      }
-      event.preventDefault();
-    });
-    svg.addEventListener("pointermove", (event) => {
-      if (!this._dragging) {
-        if (this._panning) {
-          const rect = svg.getBoundingClientRect();
-          const scaleX = graph.width / rect.width;
-          const scaleY = graph.height / rect.height;
-          this._view.x = this._panning.viewX + (event.clientX - this._panning.startX) * scaleX;
-          this._view.y = this._panning.viewY + (event.clientY - this._panning.startY) * scaleY;
-          this._clampView(graph.width, graph.height);
-          this._applyViewTransform();
-          event.preventDefault();
-        }
-        return;
-      }
-      this._moveDraggedNode(event);
-      event.preventDefault();
-    });
-    svg.addEventListener("pointerup", () => {
-      this._stopDrag();
-      this._panning = undefined;
-      svg.classList.remove("panning");
-    });
-    svg.addEventListener("pointerleave", () => {
-      this._stopDrag();
-      this._panning = undefined;
-      svg.classList.remove("panning");
-    });
-  }
-
-  _startDrag(event, nodeElement) {
-    this._dragging = nodeElement.getAttribute("data-node-id");
-    if (this._animationFrame) {
-      window.cancelAnimationFrame(this._animationFrame);
-      this._animationFrame = undefined;
-    }
-    if (nodeElement.setPointerCapture) {
-      nodeElement.setPointerCapture(event.pointerId);
-    }
-    this._moveDraggedNode(event);
-    this._dragMoveHandler = (moveEvent) => {
-      this._moveDraggedNode(moveEvent);
-      moveEvent.preventDefault();
-    };
-    this._dragEndHandler = () => {
-      this._stopDrag();
-    };
-    window.addEventListener("pointermove", this._dragMoveHandler, { passive: false });
-    window.addEventListener("pointerup", this._dragEndHandler, { once: true });
+    const point = this._eventToRawSvgPoint(svg, event);
+    this._zoomAt(event.deltaY < 0 ? 1.12 : 1 / 1.12, point.x, point.y);
     event.preventDefault();
   }
 
-  _stopDrag() {
-    if (!this._dragging) {
+  _onSvgPointerDown(event) {
+    if (event.target.closest && event.target.closest(".node")) {
       return;
     }
-    const draggedId = this._dragging;
-    this._dragging = undefined;
-    this._pinned.add(draggedId);
-    if (this._dragMoveHandler) {
-      window.removeEventListener("pointermove", this._dragMoveHandler);
-      this._dragMoveHandler = undefined;
+    const svg = this.shadowRoot.querySelector("svg");
+    if (!svg) {
+      return;
     }
-    this._dragEndHandler = undefined;
-    if (this._activeGraph) {
-      const graphNode = this._activeGraph.nodes.find((node) => node.id === draggedId);
-      if (graphNode) {
-        graphNode.pinned = true;
-      }
-      this._startSimulation(this._activeGraph);
+    this._pan = {
+      startX: event.clientX,
+      startY: event.clientY,
+      viewX: this._view.x,
+      viewY: this._view.y,
+    };
+    svg.classList.add("panning");
+    if (svg.setPointerCapture) {
+      svg.setPointerCapture(event.pointerId);
+    }
+    event.preventDefault();
+  }
+
+  _onSvgPointerMove(event) {
+    if (!this._pan || this._drag) {
+      return;
+    }
+    const svg = this.shadowRoot.querySelector("svg");
+    if (!svg) {
+      return;
+    }
+    const rect = svg.getBoundingClientRect();
+    const scaleX = this._graph.width / rect.width;
+    const scaleY = this._graph.height / rect.height;
+    this._view.x = this._pan.viewX + (event.clientX - this._pan.startX) * scaleX;
+    this._view.y = this._pan.viewY + (event.clientY - this._pan.startY) * scaleY;
+    this._clampView();
+    this._applyViewTransform();
+    event.preventDefault();
+  }
+
+  _endPan() {
+    this._pan = undefined;
+    const svg = this.shadowRoot.querySelector("svg");
+    if (svg) {
+      svg.classList.remove("panning");
     }
   }
 
-  _eventToSvgPoint(svg, event) {
+  _startNodeDrag(event, element) {
+    const nodeId = element.getAttribute("data-node-id");
+    const node = this._graph.nodeById.get(nodeId);
+    const svg = this.shadowRoot.querySelector("svg");
+    if (!node || node.isCenter || !svg) {
+      return;
+    }
+    const pointer = this._eventToGraphPoint(svg, event);
+    this._drag = {
+      id: node.id,
+      offsetX: node.x - pointer.x,
+      offsetY: node.y - pointer.y,
+      moved: false,
+    };
+    node.pinned = true;
+    this._stopSimulation();
+
+    this._dragMove = (moveEvent) => {
+      this._moveDraggedNode(moveEvent);
+      moveEvent.preventDefault();
+    };
+    this._dragEnd = () => this._finishNodeDrag();
+    window.addEventListener("pointermove", this._dragMove, { passive: false });
+    window.addEventListener("pointerup", this._dragEnd, { once: true });
+    if (element.setPointerCapture) {
+      element.setPointerCapture(event.pointerId);
+    }
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  _moveDraggedNode(event) {
+    if (!this._drag) {
+      return;
+    }
+    const svg = this.shadowRoot.querySelector("svg");
+    const node = this._graph.nodeById.get(this._drag.id);
+    if (!svg || !node) {
+      return;
+    }
+    const point = this._eventToGraphPoint(svg, event);
+    node.x = Math.max(72, Math.min(this._graph.width - 72, point.x + this._drag.offsetX));
+    node.y = Math.max(72, Math.min(this._graph.height - 72, point.y + this._drag.offsetY));
+    node.vx = 0;
+    node.vy = 0;
+    this._drag.moved = true;
+    this._resolveCollisions(this._graph.nodes, this._graph.width, this._graph.height, 8);
+    this._persistGraphState(this._graph.nodes);
+    this._syncGraphDom();
+  }
+
+  _finishNodeDrag() {
+    if (!this._drag) {
+      return;
+    }
+    const node = this._graph.nodeById.get(this._drag.id);
+    const moved = this._drag.moved;
+    this._removeWindowDragHandlers();
+    if (node) {
+      this._placePinnedNode(node);
+      node.pinned = true;
+      node.vx = 0;
+      node.vy = 0;
+    }
+    this._drag = undefined;
+    this._suppressClick = moved;
+    this._persistGraphState(this._graph.nodes);
+    this._wakeSimulation(0.75);
+  }
+
+  _removeWindowDragHandlers() {
+    if (this._dragMove) {
+      window.removeEventListener("pointermove", this._dragMove);
+      this._dragMove = undefined;
+    }
+    this._dragEnd = undefined;
+  }
+
+  _placePinnedNode(node) {
+    const originalX = node.x;
+    const originalY = node.y;
+    const candidates = [{ x: originalX, y: originalY }];
+    for (let radius = 42; radius <= 220; radius += 26) {
+      for (let step = 0; step < 14; step += 1) {
+        const angle = (Math.PI * 2 * step) / 14;
+        candidates.push({
+          x: originalX + Math.cos(angle) * radius,
+          y: originalY + Math.sin(angle) * radius,
+        });
+      }
+    }
+
+    let best = candidates[0];
+    let bestScore = Infinity;
+    candidates.forEach((candidate) => {
+      const x = Math.max(72, Math.min(this._graph.width - 72, candidate.x));
+      const y = Math.max(72, Math.min(this._graph.height - 72, candidate.y));
+      let overlapPenalty = 0;
+      this._graph.nodes.forEach((other) => {
+        if (other.id === node.id) {
+          return;
+        }
+        const dx = other.x - x;
+        const dy = other.y - y;
+        const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+        const minDistance = node.radius + other.radius + 54;
+        if (distance < minDistance) {
+          overlapPenalty += (minDistance - distance) * 80;
+        }
+      });
+      const travel = Math.hypot(x - originalX, y - originalY);
+      const score = overlapPenalty + travel;
+      if (score < bestScore) {
+        bestScore = score;
+        best = { x, y };
+      }
+    });
+
+    node.x = best.x;
+    node.y = best.y;
+  }
+
+  _eventToRawSvgPoint(svg, event) {
+    const rect = svg.getBoundingClientRect();
+    const viewBox = svg.viewBox.baseVal;
+    return {
+      x: ((event.clientX - rect.left) / rect.width) * viewBox.width + viewBox.x,
+      y: ((event.clientY - rect.top) / rect.height) * viewBox.height + viewBox.y,
+    };
+  }
+
+  _eventToGraphPoint(svg, event) {
     const raw = this._eventToRawSvgPoint(svg, event);
     return {
       x: (raw.x - this._view.x) / this._view.scale,
@@ -863,54 +1077,8 @@ class MatterMapPanel extends HTMLElement {
     };
   }
 
-  _eventToRawSvgPoint(svg, event) {
-    const rect = svg.getBoundingClientRect();
-    const viewBox = svg.viewBox.baseVal;
-    const rawX = ((event.clientX - rect.left) / rect.width) * viewBox.width + viewBox.x;
-    const rawY = ((event.clientY - rect.top) / rect.height) * viewBox.height + viewBox.y;
-    return {
-      x: rawX,
-      y: rawY,
-    };
-  }
-
-  _moveDraggedNode(event) {
-    if (!this._dragging || !this._activeGraph) {
-      return;
-    }
-    const svg = this.shadowRoot.querySelector("svg");
-    if (!svg) {
-      return;
-    }
-    const graph = this._activeGraph;
-    const point = this._eventToSvgPoint(svg, event);
-    const x = Math.max(48, Math.min(graph.width - 48, point.x));
-    const y = Math.max(48, Math.min(graph.height - 48, point.y));
-    const position = this._positions.get(this._dragging);
-    if (position) {
-      position.x = x;
-      position.y = y;
-      position.vx = 0;
-      position.vy = 0;
-    }
-    const graphNode = graph.nodes.find((node) => node.id === this._dragging);
-    if (graphNode) {
-      graphNode.x = x;
-      graphNode.y = y;
-      graphNode.vx = 0;
-      graphNode.vy = 0;
-      graphNode.pinned = true;
-      this._syncGraphDom(graph.nodes, graph.links);
-    }
-  }
-
   _zoomBy(factor) {
-    const svg = this.shadowRoot.querySelector("svg");
-    if (!svg) {
-      return;
-    }
-    const viewBox = svg.viewBox.baseVal;
-    this._zoomAt(factor, viewBox.width / 2, viewBox.height / 2);
+    this._zoomAt(factor, this._graph.width / 2, this._graph.height / 2);
   }
 
   _zoomAt(factor, rawX, rawY) {
@@ -921,7 +1089,7 @@ class MatterMapPanel extends HTMLElement {
     this._view.scale = newScale;
     this._view.x = rawX - graphX * newScale;
     this._view.y = rawY - graphY * newScale;
-    this._clampView(1120, 720);
+    this._clampView();
     this._applyViewTransform();
   }
 
@@ -930,22 +1098,18 @@ class MatterMapPanel extends HTMLElement {
     this._applyViewTransform();
   }
 
-  _clampView(width, height) {
-    const minScale = 0.35;
-    this._view.scale = Math.max(minScale, Math.min(4, this._view.scale));
-    const marginX = width * this._view.scale;
-    const marginY = height * this._view.scale;
-    this._view.x = Math.max(-marginX, Math.min(width, this._view.x));
-    this._view.y = Math.max(-marginY, Math.min(height, this._view.y));
+  _clampView() {
+    const width = this._graph.width;
+    const height = this._graph.height;
+    this._view.scale = Math.max(0.35, Math.min(4, this._view.scale));
+    this._view.x = Math.max(-width * this._view.scale, Math.min(width, this._view.x));
+    this._view.y = Math.max(-height * this._view.scale, Math.min(height, this._view.y));
   }
 
   _applyViewTransform() {
     const viewport = this.shadowRoot.querySelector(".viewport");
     if (viewport) {
-      viewport.setAttribute(
-        "transform",
-        `translate(${this._view.x}, ${this._view.y}) scale(${this._view.scale})`
-      );
+      viewport.setAttribute("transform", `translate(${this._view.x}, ${this._view.y}) scale(${this._view.scale})`);
     }
   }
 
@@ -953,13 +1117,7 @@ class MatterMapPanel extends HTMLElement {
     if (!nodes.length) {
       return undefined;
     }
-
-    const degrees = new Map();
-    links.forEach((link) => {
-      degrees.set(link.source, (degrees.get(link.source) || 0) + 1);
-      degrees.set(link.target, (degrees.get(link.target) || 0) + 1);
-    });
-
+    const degrees = this._degrees(links);
     return nodes
       .map((node) => ({
         node,
@@ -996,33 +1154,43 @@ class MatterMapPanel extends HTMLElement {
     ) {
       score += 1000;
     }
-
     return score;
+  }
+
+  _nodeRadius(node, isCenter) {
+    if (isCenter || node.isCenter) {
+      return 34;
+    }
+    if (node.role && node.role.includes("routing")) {
+      return 28;
+    }
+    if (node.external) {
+      return 22;
+    }
+    return 24;
   }
 
   _linkSvg(link) {
     const color = this._qualityColor(link.quality);
     const width = Math.max(2, Math.min(8, ((link.quality || 35) / 100) * 7));
     const label = link.quality === null || link.quality === undefined ? link.relationship : `${link.relationship} ${link.quality}`;
-    const midX = (link.sourceNode.x + link.targetNode.x) / 2;
-    const midY = (link.sourceNode.y + link.targetNode.y) / 2;
     return `
-      <line class="link" data-link-id="${this._escapeAttr(link.id)}" x1="${link.sourceNode.x}" y1="${link.sourceNode.y}" x2="${link.targetNode.x}" y2="${link.targetNode.y}" stroke="${color}" stroke-width="${width}"></line>
-      <text class="link-label" data-link-id="${this._escapeAttr(link.id)}" x="${midX}" y="${midY - 8}">${this._escape(label)}</text>
+      <line class="link" data-link-id="${this._escapeAttr(link.id)}" stroke="${color}" stroke-width="${width}"></line>
+      <text class="link-label" data-link-id="${this._escapeAttr(link.id)}">${this._escape(label)}</text>
     `;
   }
 
   _nodeSvg(node) {
     const selected = node.id === this._selected ? " selected" : "";
     const center = node.isCenter ? " center" : "";
+    const pinned = node.pinned && !node.isCenter ? " pinned" : "";
     const fill = node.external ? "#7f8c8d" : node.role.includes("routing") ? "#16a085" : "#3498db";
-    const radius = node.isCenter ? 34 : node.role.includes("routing") ? 28 : node.external ? 22 : 24;
     const role = node.external ? "external" : this._humanize(node.role);
     return `
-      <g class="node${selected}${center}" data-node-id="${this._escapeAttr(node.id)}" transform="translate(${node.x}, ${node.y})">
-        <circle r="${radius}" fill="${fill}"></circle>
-        <text y="${radius + 18}">${this._escape(this._shortLabel(node.label))}</text>
-        <text class="role" y="${radius + 33}">${this._escape(node.isCenter ? "center " + role : role)}</text>
+      <g class="node${selected}${center}${pinned}" data-node-id="${this._escapeAttr(node.id)}">
+        <circle r="${node.radius}" fill="${fill}"></circle>
+        <text y="${node.radius + 18}">${this._escape(this._shortLabel(node.label))}</text>
+        <text class="role" y="${node.radius + 33}">${this._escape(node.isCenter ? "center " + role : role)}</text>
       </g>
     `;
   }
@@ -1106,18 +1274,6 @@ class MatterMapPanel extends HTMLElement {
         </span>
       </button>
     `;
-  }
-
-  _linkSummary(links, nodeId) {
-    return links
-      .slice(0, 6)
-      .map((link) => {
-        const direction = link.source === nodeId ? "to" : "from";
-        const other = link.source === nodeId ? link.target : link.source;
-        const quality = link.quality === null || link.quality === undefined ? "unknown quality" : `${link.quality}% quality`;
-        return `${link.relationship} ${direction} ${other} (${quality})`;
-      })
-      .join("; ");
   }
 
   _qualityColor(quality) {
