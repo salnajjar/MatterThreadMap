@@ -533,12 +533,13 @@ class MatterMapPanel extends HTMLElement {
     const centerX = graph.width / 2;
     const centerY = graph.height / 2;
     const ordered = this._orderedNodes(rawNodes, rawLinks, graph.centerId);
+    const layoutPositions = this._layoutPositions(ordered, rawLinks, graph.centerId, graph.width, graph.height);
 
     ordered.forEach((rawNode, index) => {
       const isCenter = rawNode.id === graph.centerId;
-      const fallback = this._fallbackPosition(index, Math.max(1, ordered.length - 1), isCenter, centerX, centerY);
+      const fallback = layoutPositions.get(rawNode.id) || { x: centerX, y: centerY };
       const state = this._stateFor(rawNode, fallback.x, fallback.y);
-      if (!isCenter && !state.pinned && this._isBadStoredPosition(state, graph.width, graph.height)) {
+      if (!isCenter && !state.pinned) {
         state.x = fallback.x;
         state.y = fallback.y;
         state.vx = 0;
@@ -583,10 +584,9 @@ class MatterMapPanel extends HTMLElement {
       })
       .filter((link) => Boolean(link));
 
-    this._repairStackedState(graph.nodes, centerX, centerY);
-    this._resolveCollisions(graph.nodes, graph.width, graph.height, 52);
+    this._resolveCollisions(graph.nodes, graph.width, graph.height, 80);
     this._persistGraphState(graph.nodes);
-    graph.alpha = 1;
+    graph.alpha = 0;
     return graph;
   }
 
@@ -621,20 +621,10 @@ class MatterMapPanel extends HTMLElement {
 
   _sizedGraph(nodeCount) {
     const graph = this._emptyGraph();
-    const radius = Math.max(300, 70 * Math.sqrt(Math.max(1, nodeCount)));
+    const radius = Math.max(430, 150 * Math.sqrt(Math.max(1, nodeCount)));
     graph.width = Math.max(1100, Math.ceil(radius * 2 + 300));
     graph.height = Math.max(760, Math.ceil(radius * 2 + 260));
     return graph;
-  }
-
-  _isBadStoredPosition(state, width, height) {
-    const edgePadding = 120;
-    return (
-      state.x < edgePadding ||
-      state.y < edgePadding ||
-      state.x > width - edgePadding ||
-      state.y > height - edgePadding
-    );
   }
 
   _stateFor(node, fallbackX, fallbackY) {
@@ -692,71 +682,93 @@ class MatterMapPanel extends HTMLElement {
     });
   }
 
-  _fallbackPosition(index, count, isCenter, centerX, centerY) {
-    if (isCenter) {
-      return { x: centerX, y: centerY };
-    }
-    const spiralIndex = Math.max(0, index - 1);
-    const angle = spiralIndex * 2.399963229728653;
-    const radius = 190 + 78 * Math.sqrt(spiralIndex);
-    return {
-      x: centerX + Math.cos(angle) * radius,
-      y: centerY + Math.sin(angle) * radius,
-    };
+  _layoutPositions(nodes, links, centerId, width, height) {
+    const positions = new Map();
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const rings = this._topologyRings(nodes, links, centerId);
+    positions.set(centerId, { x: centerX, y: centerY });
+
+    rings.forEach((ringNodes, ringIndex) => {
+      if (!ringNodes.length) {
+        return;
+      }
+      const minArc = 118;
+      const baseRadius = 230 + ringIndex * 170;
+      const radius = Math.max(baseRadius, (ringNodes.length * minArc) / (Math.PI * 2));
+      const offset = ringIndex % 2 ? Math.PI / ringNodes.length : -Math.PI / 2;
+
+      ringNodes.forEach((node, index) => {
+        const angle = offset + (Math.PI * 2 * index) / ringNodes.length;
+        positions.set(node.id, {
+          x: centerX + Math.cos(angle) * radius,
+          y: centerY + Math.sin(angle) * radius,
+        });
+      });
+    });
+
+    return positions;
   }
 
-  _repairStackedState(nodes, centerX, centerY) {
-    const buckets = new Map();
-    nodes.forEach((node) => {
-      if (node.isCenter || node.pinned) {
-        return;
-      }
-      const key = `${Math.round(node.x / 24)}:${Math.round(node.y / 24)}`;
-      buckets.set(key, (buckets.get(key) || 0) + 1);
-    });
-
-    let needsRepair = false;
-    buckets.forEach((count) => {
-      if (count > 2) {
-        needsRepair = true;
+  _topologyRings(nodes, links, centerId) {
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const adjacency = new Map(nodes.map((node) => [node.id, new Set()]));
+    links.forEach((link) => {
+      if (adjacency.has(link.source) && adjacency.has(link.target)) {
+        adjacency.get(link.source).add(link.target);
+        adjacency.get(link.target).add(link.source);
       }
     });
 
-    if (!needsRepair) {
-      return;
+    const distances = new Map();
+    const queue = [];
+    if (centerId && adjacency.has(centerId)) {
+      distances.set(centerId, 0);
+      queue.push(centerId);
     }
 
-    let index = 1;
+    while (queue.length) {
+      const current = queue.shift();
+      const nextDistance = distances.get(current) + 1;
+      adjacency.get(current).forEach((neighborId) => {
+        if (!distances.has(neighborId)) {
+          distances.set(neighborId, nextDistance);
+          queue.push(neighborId);
+        }
+      });
+    }
+
+    const maxDistance = Math.max(1, ...Array.from(distances.values()));
+    const rings = [];
     nodes.forEach((node) => {
-      if (node.isCenter || node.pinned) {
+      if (node.id === centerId) {
         return;
       }
-      const fallback = this._fallbackPosition(index, nodes.length, false, centerX, centerY);
-      node.x = fallback.x;
-      node.y = fallback.y;
-      node.vx = 0;
-      node.vy = 0;
-      index += 1;
+      const distance = distances.has(node.id) ? distances.get(node.id) : maxDistance + 1;
+      const ringIndex = Math.max(0, distance - 1);
+      if (!rings[ringIndex]) {
+        rings[ringIndex] = [];
+      }
+      rings[ringIndex].push(byId.get(node.id));
     });
+
+    rings.forEach((ring) => {
+      ring.sort((a, b) => {
+        const aRouter = a.role && a.role.includes("routing") ? 0 : 1;
+        const bRouter = b.role && b.role.includes("routing") ? 0 : 1;
+        if (aRouter !== bRouter) {
+          return aRouter - bRouter;
+        }
+        return String(a.label || a.id).localeCompare(String(b.label || b.id));
+      });
+    });
+
+    return rings;
   }
 
   _startSimulation() {
     this._stopSimulation();
-    if (!this._graph.nodes.length) {
-      return;
-    }
-    this._graph.alpha = Math.max(this._graph.alpha, 0.9);
-    const step = () => {
-      this._tick();
-      this._syncGraphDom();
-      this._graph.alpha *= 0.982;
-      if (this._graph.alpha > 0.004 || this._drag) {
-        this._frame = window.requestAnimationFrame(step);
-      } else {
-        this._frame = undefined;
-      }
-    };
-    this._frame = window.requestAnimationFrame(step);
+    this._syncGraphDom();
   }
 
   _stopSimulation() {
@@ -767,10 +779,9 @@ class MatterMapPanel extends HTMLElement {
   }
 
   _wakeSimulation(alpha) {
-    this._graph.alpha = Math.max(this._graph.alpha, alpha || 0.45);
-    if (!this._frame) {
-      this._startSimulation();
-    }
+    this._resolveCollisions(this._graph.nodes, this._graph.width, this._graph.height, 30);
+    this._persistGraphState(this._graph.nodes);
+    this._syncGraphDom();
   }
 
   _tick() {
