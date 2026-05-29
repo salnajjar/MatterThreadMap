@@ -781,6 +781,7 @@ class MatterMapPanel extends HTMLElement {
     this._applyRepulsion(graph.nodes, alpha);
     this._applyContainment(graph.nodes, graph.width, graph.height, alpha);
     this._integrate(graph.nodes, graph.width, graph.height);
+    this._rebalanceCloud(graph.nodes, graph.width, graph.height, alpha);
     this._persistGraphState(graph.nodes);
   }
 
@@ -870,6 +871,35 @@ class MatterMapPanel extends HTMLElement {
       node.vy *= 0.86;
       node.x = Math.max(padding, Math.min(width - padding, node.x + node.vx));
       node.y = Math.max(padding, Math.min(height - padding, node.y + node.vy));
+    });
+  }
+
+  _rebalanceCloud(nodes, width, height, alpha) {
+    const movable = nodes.filter((node) => !node.isCenter && !node.pinned);
+    if (!movable.length) {
+      return;
+    }
+
+    const bounds = movable.reduce(
+      (acc, node) => ({
+        minX: Math.min(acc.minX, node.x),
+        maxX: Math.max(acc.maxX, node.x),
+        minY: Math.min(acc.minY, node.y),
+        maxY: Math.max(acc.maxY, node.y),
+      }),
+      { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity }
+    );
+
+    const cloudX = (bounds.minX + bounds.maxX) / 2;
+    const cloudY = (bounds.minY + bounds.maxY) / 2;
+    const targetX = width / 2;
+    const targetY = height / 2;
+    const shiftX = (targetX - cloudX) * 0.055 * alpha;
+    const shiftY = (targetY - cloudY) * 0.055 * alpha;
+
+    movable.forEach((node) => {
+      node.x += shiftX;
+      node.y += shiftY;
     });
   }
 
